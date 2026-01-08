@@ -2,66 +2,64 @@ use anyhow::{bail, Result};
 use nom::{Err as NomErr};
 use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsMessage, TlsRecordType};
 
-pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        let input = &buf[offset..];
-        let (_, hdr) = match parse_tls_record_header(input) {
-            Ok(res) => res,
-            Err(NomErr::Incomplete(_)) => break,
-            Err(e) => bail!("{} sent truly invalid TLS data: {:?}", source, e),
-        };
+pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, Option<TlsRecordType>)> {
+    let input = buf;
+    let (_, hdr) = match parse_tls_record_header(input) {
+        Ok(res) => res,
+        Err(NomErr::Incomplete(_)) => return Ok((0, None)),
+        Err(e) => bail!("{} sent truly invalid TLS data: {:?}", source, e),
+    };
 
-        // RFC 5246/8446: Max record length is 2^14 bytes (16384)
-        if hdr.len > 16384 {
-            bail!("{} sent oversized TLS record: {} bytes", source, hdr.len);
-        }
-
-        // Sanity check version: 0x0301 (TLS 1.0) or higher.
-        if hdr.version.0 < 0x0301 {
-            bail!("{} sent unsupported TLS version: 0x{:04x}", source, hdr.version.0);
-        }
-
-        let record_len = 5 + hdr.len as usize;
-        if input.len() < record_len {
-            break;
-        }
-        let record = &input[..record_len];
-
-        match hdr.record_type {
-            TlsRecordType::ApplicationData => {
-                log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
-                return Ok((offset + record_len, true));
-            }
-            TlsRecordType::Handshake => {
-                if hdr.len < 4 {
-                    bail!("{} sent too short Handshake record: {} bytes", source, hdr.len);
-                }
-                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            }
-            TlsRecordType::ChangeCipherSpec => {
-                if hdr.len != 1 {
-                    bail!("{} sent invalid ChangeCipherSpec record: {} bytes", source, hdr.len);
-                }
-                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            }
-            TlsRecordType::Alert => {
-                if hdr.len != 2 {
-                    bail!("{} sent invalid Alert record: {} bytes", source, hdr.len);
-                }
-                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            }
-            TlsRecordType::Heartbeat => {
-                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            }
-            _ => {
-                bail!("{} sent invalid or unsupported TLS record type: {}", source, hdr.record_type.0);
-            }
-        }
-        offset += record_len;
+    // RFC 5246/8446: Max record length is 2^14 bytes (16384)
+    if hdr.len > 16384 {
+        bail!("{} sent oversized TLS record: {} bytes", source, hdr.len);
     }
 
-    Ok((offset, false))
+    // Sanity check version: 0x0301 (TLS 1.0) or higher.
+    if hdr.version.0 < 0x0301 {
+        bail!("{} sent unsupported TLS version: 0x{:04x}", source, hdr.version.0);
+    }
+
+    let record_len = 5 + hdr.len as usize;
+    if input.len() < record_len {
+        return Ok((0, None));
+    }
+    let record = &input[..record_len];
+
+    match hdr.record_type {
+        TlsRecordType::ApplicationData => {
+            log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
+            Ok((record_len, Some(TlsRecordType::ApplicationData)))
+        }
+        TlsRecordType::Handshake => {
+            if hdr.len < 4 {
+                bail!("{} sent too short Handshake record: {} bytes", source, hdr.len);
+            }
+            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            Ok((record_len, Some(TlsRecordType::Handshake)))
+        }
+        TlsRecordType::ChangeCipherSpec => {
+            if hdr.len != 1 {
+                bail!("{} sent invalid ChangeCipherSpec record: {} bytes", source, hdr.len);
+            }
+            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            Ok((record_len, Some(TlsRecordType::ChangeCipherSpec)))
+        }
+        TlsRecordType::Alert => {
+            if hdr.len != 2 {
+                bail!("{} sent invalid Alert record: {} bytes", source, hdr.len);
+            }
+            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            Ok((record_len, Some(TlsRecordType::Alert)))
+        }
+        TlsRecordType::Heartbeat => {
+            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            Ok((record_len, Some(TlsRecordType::Heartbeat)))
+        }
+        _ => {
+            bail!("{} sent invalid or unsupported TLS record type: {}", source, hdr.record_type.0);
+        }
+    }
 }
 
 fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, record_payload_len: u16) -> Result<()> {
@@ -117,9 +115,9 @@ mod tests {
     #[test]
     fn test_process_tls_buffer_incomplete() {
         let buf = [0x16, 0x03, 0x01]; // Incomplete header
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 0);
-        assert!(!hit_app_data);
+        assert_eq!(record_type, None);
     }
 
     #[test]
@@ -127,18 +125,18 @@ mod tests {
         // Simple Handshake header (HelloRequest)
         let mut buf = vec![0x16, 0x03, 0x03, 0x00, 0x04];
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // HelloRequest (Type 0, Length 0)
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 9);
-        assert!(!hit_app_data);
+        assert_eq!(record_type, Some(TlsRecordType::Handshake));
     }
 
     #[test]
     fn test_process_tls_buffer_application_data() {
         let mut buf = vec![0x17, 0x03, 0x03, 0x00, 0x04];
         buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 9);
-        assert!(hit_app_data);
+        assert_eq!(record_type, Some(TlsRecordType::ApplicationData));
     }
 
     #[test]
@@ -148,25 +146,31 @@ mod tests {
         buf.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x02]); // App Data
         buf.extend_from_slice(&[0x05, 0x06]);
         
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
-        assert_eq!(consumed, 9 + 7);
-        assert!(hit_app_data);
+        // First call: Handshake
+        let (consumed1, record_type1) = process_tls_buffer(&buf, "Test").unwrap();
+        assert_eq!(consumed1, 9);
+        assert_eq!(record_type1, Some(TlsRecordType::Handshake));
+
+        // Second call: App Data
+        let (consumed2, record_type2) = process_tls_buffer(&buf[consumed1..], "Test").unwrap();
+        assert_eq!(consumed2, 7);
+        assert_eq!(record_type2, Some(TlsRecordType::ApplicationData));
     }
 
     #[test]
     fn test_process_tls_buffer_change_cipher_spec() {
         let buf = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 6);
-        assert!(!hit_app_data);
+        assert_eq!(record_type, Some(TlsRecordType::ChangeCipherSpec));
     }
 
     #[test]
     fn test_process_tls_buffer_alert() {
         let buf = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00]; // Close notify
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 7);
-        assert!(!hit_app_data);
+        assert_eq!(record_type, Some(TlsRecordType::Alert));
     }
 
     #[test]
@@ -180,9 +184,9 @@ mod tests {
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&heartbeat_data);
 
-        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        let (consumed, record_type) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 5 + heartbeat_data.len());
-        assert!(!hit_app_data);
+        assert_eq!(record_type, Some(TlsRecordType::Heartbeat));
     }
 
     #[test]

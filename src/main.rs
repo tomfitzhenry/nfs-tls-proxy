@@ -152,6 +152,8 @@ async fn negotiate_starttls(client: &mut TcpStream, upstream: &mut TcpStream) ->
     Ok(())
 }
 
+use tls_parser::TlsRecordType;
+
 async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: &mut TcpStream) -> Result<(BytesMut, BytesMut)> {
     let mut client_buf = BytesMut::with_capacity(4096);
     let mut upstream_buf = BytesMut::with_capacity(4096);
@@ -168,15 +170,18 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                 }
                 client_buf.extend_from_slice(&client_temp_buf[..n]);
                 
-                let (consumed, hit_app_data) = tls::process_tls_buffer(&client_buf, "Client")?;
-                
-                if consumed > 0 {
+                loop {
+                    let (consumed, record_type) = tls::process_tls_buffer(&client_buf, "Client")?;
+                    if consumed == 0 {
+                        break;
+                    }
+                    
                     let data = client_buf.split_to(consumed);
                     upstream_socket.write_all(&data).await?;
-                }
-                
-                if hit_app_data {
-                    log::info!("Client sent Application Data.");
+                    
+                    if let Some(TlsRecordType::ApplicationData) = record_type {
+                        log::info!("Client sent Application Data.");
+                    }
                 }
             }
             res = upstream_socket.read(&mut upstream_temp_buf) => {
@@ -186,16 +191,19 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                 }
                 upstream_buf.extend_from_slice(&upstream_temp_buf[..n]);
                 
-                let (consumed, hit_app_data) = tls::process_tls_buffer(&upstream_buf, "Upstream")?;
-                
-                if consumed > 0 {
+                loop {
+                    let (consumed, record_type) = tls::process_tls_buffer(&upstream_buf, "Upstream")?;
+                    if consumed == 0 {
+                        break;
+                    }
+                    
                     let data = upstream_buf.split_to(consumed);
                     client_socket.write_all(&data).await?;
-                }
-                
-                if hit_app_data {
-                    log::info!("Upstream sent Application Data. Handshake established.");
-                    return Ok((client_buf, upstream_buf));
+                    
+                    if let Some(TlsRecordType::ApplicationData) = record_type {
+                        log::info!("Upstream sent Application Data. Handshake established.");
+                        return Ok((client_buf, upstream_buf));
+                    }
                 }
             }
         }
