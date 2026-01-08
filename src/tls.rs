@@ -1,94 +1,43 @@
 use anyhow::{bail, Result};
-use nom::bytes::streaming::take;
-use nom::{Err as NomErr, IResult};
-use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordHeader, TlsRecordType};
+use nom::{Err as NomErr};
+use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordType};
 
 pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
-    let mut input = buf;
-    let mut found_app_data = false;
+    let mut offset = 0;
+    while offset < buf.len() {
+        let input = &buf[offset..];
+        let (_, hdr) = match parse_tls_record_header(input) {
+            Ok(res) => res,
+            Err(NomErr::Incomplete(_)) => break,
+            Err(e) => bail!("{} sent truly invalid TLS data: {:?}", source, e),
+        };
 
-    while !input.is_empty() {
-        match parse_record_envelope(input) {
-            Ok((remaining, (hdr, record_data))) => {
-                found_app_data = handle_tls_record(hdr, record_data, source)?;
+        let record_len = 5 + hdr.len as usize;
+        if input.len() < record_len {
+            break;
+        }
+        let record = &input[..record_len];
 
-                input = remaining;
-
-                if found_app_data {
-                    break;
+        match hdr.record_type {
+            TlsRecordType::ApplicationData => {
+                log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
+                return Ok((offset + record_len, true));
+            }
+            TlsRecordType::Handshake | TlsRecordType::ChangeCipherSpec | TlsRecordType::Alert | TlsRecordType::Heartbeat => {
+                if let Err(e) = parse_tls_plaintext(record) {
+                    log::debug!("{} {:?} parsing issue (potentially encrypted): {:?}", source, hdr.record_type, e);
+                    bail!("{} sent malformed or unsupported {:?} data: {:?}", source, hdr.record_type, e);
                 }
+                log::debug!("Parsed {} {:?}: Len={}", source, hdr.record_type, hdr.len);
             }
-            Err(NomErr::Incomplete(_)) => {
-                break; // Need more data
-            }
-            Err(e) => {
-                bail!("{} sent truly invalid TLS data: {:?}", source, e);
+            _ => {
+                bail!("{} sent invalid or unsupported TLS record type: {}", source, hdr.record_type.0);
             }
         }
+        offset += record_len;
     }
 
-    let consumed = buf.len() - input.len();
-    Ok((consumed, found_app_data))
-}
-fn handle_tls_record(hdr: TlsRecordHeader, record_data: &[u8], source: &str) -> Result<bool> {
-    match hdr.record_type {
-        TlsRecordType::Handshake
-        | TlsRecordType::ChangeCipherSpec
-        | TlsRecordType::Alert
-        | TlsRecordType::Heartbeat => {
-            match parse_tls_plaintext(record_data) {
-                Ok((_, plaintext)) => {
-                    log::debug!(
-                        "Parsed {} {:?}: Len={}",
-                        source,
-                        hdr.record_type,
-                        plaintext.hdr.len
-                    );
-                }
-                Err(e) => {
-                    log::debug!(
-                        "{} {:?} parsing issue (potentially encrypted): {:?}",
-                        source,
-                        hdr.record_type,
-                        e
-                    );
-                    // Treat parsing errors as fatal during handshake phase
-                    bail!(
-                        "{} sent malformed or unsupported {:?} data: {:?}",
-                        source,
-                        hdr.record_type,
-                        e
-                    );
-                }
-            }
-            Ok(false)
-        }
-        TlsRecordType::ApplicationData => {
-            log::debug!(
-                "Forwarding {} record: Type={:?}, Len={}",
-                source,
-                hdr.record_type,
-                hdr.len
-            );
-            Ok(true)
-        }
-        _ => {
-            bail!(
-                "{} sent invalid or unsupported TLS record type: {}",
-                source,
-                hdr.record_type.0
-            );
-        }
-    }
-}
-
-
-fn parse_record_envelope(i: &[u8]) -> IResult<&[u8], (TlsRecordHeader, &[u8])> {
-    let start = i;
-    let (i, hdr) = parse_tls_record_header(i)?;
-    let (i, _) = take(hdr.len)(i)?;
-    let consumed = start.len() - i.len();
-    Ok((i, (hdr, &start[..consumed])))
+    Ok((offset, false))
 }
 
 #[cfg(test)]
