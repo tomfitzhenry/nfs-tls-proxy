@@ -13,7 +13,8 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                 match hdr.record_type {
                     TlsRecordType::Handshake
                     | TlsRecordType::ChangeCipherSpec
-                    | TlsRecordType::Alert => {
+                    | TlsRecordType::Alert
+                    | TlsRecordType::Heartbeat => {
                         match parse_tls_plaintext(record_data) {
                             Ok((_, plaintext)) => {
                                 log::debug!(
@@ -48,14 +49,6 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                             hdr.len
                         );
                         found_app_data = true;
-                    }
-                    TlsRecordType::Heartbeat => {
-                        log::debug!(
-                            "Forwarding {} record: Type={:?}, Len={}",
-                            source,
-                            hdr.record_type,
-                            hdr.len
-                        );
                     }
                     _ => {
                         bail!(
@@ -149,6 +142,22 @@ mod tests {
         let buf = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00]; // Close notify
         let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 7);
+        assert!(!hit_app_data);
+    }
+
+    #[test]
+    fn test_process_tls_buffer_heartbeat() {
+        // Heartbeat request: Type 1, Payload Length 1, 1 byte payload, 16 bytes padding
+        let mut heartbeat_data = vec![0x01, 0x00, 0x01, 0x42];
+        heartbeat_data.extend_from_slice(&[0x00; 16]);
+        
+        let mut buf = vec![0x18, 0x03, 0x03];
+        let len = heartbeat_data.len() as u16;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&heartbeat_data);
+
+        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        assert_eq!(consumed, 5 + heartbeat_data.len());
         assert!(!hit_app_data);
     }
 
