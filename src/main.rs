@@ -140,8 +140,8 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
                 }
                 
                 if hit_app_data {
-                    log::info!("Client sent Application Data. Handshake considered established.");
-                    break;
+                    log::info!("Client sent Application Data. Still waiting for Upstream to confirm established session...");
+                    // We don't break here! We continue validating headers for both sides.
                 }
             }
             res = upstream_socket.read(&mut upstream_temp_buf) => {
@@ -160,7 +160,7 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
                 }
                 
                 if hit_app_data {
-                    log::info!("Upstream sent Application Data. Handshake considered established.");
+                    log::info!("Upstream sent Application Data. Handshake considered established by server.");
                     break;
                 }
             }
