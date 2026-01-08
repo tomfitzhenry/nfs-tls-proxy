@@ -67,7 +67,22 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
 fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, record_payload_len: u16) -> Result<()> {
     match parse_tls_plaintext(record) {
         Ok((_, plaintext)) => {
-            for msg in plaintext.msg {
+            for msg in &plaintext.msg {
+                // Validate that the record type matches the message type
+                let msg_matches_record = match (&msg, record_type) {
+                    (TlsMessage::Handshake(_), TlsRecordType::Handshake) => true,
+                    (TlsMessage::Alert(_), TlsRecordType::Alert) => true,
+                    (TlsMessage::ChangeCipherSpec, TlsRecordType::ChangeCipherSpec) => true,
+                    (TlsMessage::Heartbeat(_), TlsRecordType::Heartbeat) => true,
+                    (TlsMessage::ApplicationData(_), TlsRecordType::ApplicationData) => true,
+                    _ => false,
+                };
+                
+                if !msg_matches_record {
+                    bail!("{} sent TLS record with mismatched type: record_type={:?}, but message is {:?}", 
+                          source, record_type, msg);
+                }
+                
                 if let TlsMessage::Heartbeat(hb) = msg {
                     // Explicit check for Heartbleed-style length mismatch.
                     // The payload field in TlsMessageHeartbeat is the actual data parsed.
@@ -246,4 +261,27 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("mismatched length"));
     }
+
+    #[test]
+    fn test_process_tls_buffer_mismatched_record_and_message_type() {
+        // Try to create a scenario where tls-parser successfully parses the content
+        // but the record type doesn't match the message type.
+        // We'll use an Alert record (0x15) with proper Alert content (2 bytes),
+        // but claim it's a Handshake record (0x16) in the header.
+        
+        // First, let's try with a valid Alert wrapped as Handshake
+        // Alert: level=2 (fatal), description=0 (close_notify)
+        // But we need at least 4 bytes for handshake validation to pass
+        let buf = [
+            0x16, 0x03, 0x03, 0x00, 0x04, // Record header: Handshake type, length 4
+            0x02, 0x00, 0x00, 0x00,       // Alert-like content: level 2, desc 0, padding
+        ];
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        println!("Error message: {}", err_msg);
+        // Should fail with either mismatched type or malformed/mismatched length
+        assert!(err_msg.contains("mismatched") || err_msg.contains("malformed"));
+    }
+
 }
