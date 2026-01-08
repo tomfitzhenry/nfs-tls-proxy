@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use nom::{Err as NomErr};
-use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordType};
+use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsMessage, TlsRecordType};
 
 pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
     let mut offset = 0;
@@ -64,13 +64,35 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
     Ok((offset, false))
 }
 
-fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, len: u16) -> Result<()> {
-    if let Err(e) = parse_tls_plaintext(record) {
-        log::debug!("{} {:?} parsing issue (potentially encrypted): {:?}", source, record_type, e);
-        bail!("{} sent malformed or unsupported {:?} data: {:?}", source, record_type, e);
+fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, record_payload_len: u16) -> Result<()> {
+    match parse_tls_plaintext(record) {
+        Ok((_, plaintext)) => {
+            for msg in plaintext.msg {
+                if let TlsMessage::Heartbeat(hb) = msg {
+                    // Explicit check for Heartbleed-style length mismatch.
+                    // The payload field in TlsMessageHeartbeat is the actual data parsed.
+                    // If its length is less than the claimed payload_len, it's an attack.
+                    if hb.payload.len() < hb.payload_len as usize {
+                        bail!("{} sent Heartbeat with mismatched length: claimed {}, got {}", source, hb.payload_len, hb.payload.len());
+                    }
+                }
+            }
+            log::debug!("Parsed {} {:?}: Len={}", source, record_type, record_payload_len);
+            Ok(())
+        }
+        Err(e) => {
+            log::debug!("{} {:?} parsing issue (potentially encrypted): {:?}", source, record_type, e);
+            
+            // If the parser fails with an error that indicates we ran out of data
+            // (even though we provided the full record), it's a length mismatch.
+            let err_str = format!("{:?}", e);
+            if err_str.contains("Complete") || err_str.contains("Incomplete") {
+                 bail!("{} sent {:?} message with mismatched length", source, record_type);
+            }
+
+            bail!("{} sent malformed or unsupported {:?} data: {:?}", source, record_type, e);
+        }
     }
-    log::debug!("Parsed {} {:?}: Len={}", source, record_type, len);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -194,5 +216,34 @@ mod tests {
         let res = process_tls_buffer(&buf, "Test");
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("invalid Alert record"));
+    }
+
+    #[test]
+    fn test_process_tls_buffer_handshake_mismatched_length() {
+        // Handshake record with length 4, but inner handshake header says length 10
+        let buf = [
+            0x16, 0x03, 0x03, 0x00, 0x04, // Record header: Handshake, length 4
+            0x00, 0x00, 0x00, 0x0a,       // Handshake header: HelloRequest (0), length 10
+        ];
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("mismatched length"));
+    }
+
+    #[test]
+    fn test_process_tls_buffer_heartbeat_mismatched_length() {
+        // Heartbeat request: Type 1, Payload Length 100, but only 1 byte payload and 16 bytes padding
+        let mut heartbeat_data = vec![0x01, 0x00, 0x64, 0x42]; // Type 1, Len 100, Payload 0x42
+        heartbeat_data.extend_from_slice(&[0x00; 16]); // 16 bytes padding
+        
+        let mut buf = vec![0x18, 0x03, 0x03]; // Heartbeat record
+        let len = heartbeat_data.len() as u16;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(&heartbeat_data);
+
+        let res = process_tls_buffer(&buf, "Test");
+        // This should fail because the payload length (100) exceeds the actual record payload length
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("mismatched length"));
     }
 }
