@@ -31,38 +31,37 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, Option<Tls
             log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
             Ok((record_len, Some(TlsRecordType::ApplicationData)))
         }
-        TlsRecordType::Handshake => {
-            if hdr.len < 4 {
-                bail!("{} sent too short Handshake record: {} bytes", source, hdr.len);
-            }
-            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            Ok((record_len, Some(TlsRecordType::Handshake)))
-        }
-        TlsRecordType::ChangeCipherSpec => {
-            if hdr.len != 1 {
-                bail!("{} sent invalid ChangeCipherSpec record: {} bytes", source, hdr.len);
-            }
-            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            Ok((record_len, Some(TlsRecordType::ChangeCipherSpec)))
-        }
-        TlsRecordType::Alert => {
-            if hdr.len != 2 {
-                bail!("{} sent invalid Alert record: {} bytes", source, hdr.len);
-            }
-            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            Ok((record_len, Some(TlsRecordType::Alert)))
-        }
-        TlsRecordType::Heartbeat => {
-            validate_plaintext(record, source, hdr.record_type, hdr.len)?;
-            Ok((record_len, Some(TlsRecordType::Heartbeat)))
-        }
         _ => {
-            bail!("{} sent invalid or unsupported TLS record type: {}", source, hdr.record_type.0);
+            validate_tls_record(record, source, hdr.record_type, hdr.len)?;
+            Ok((record_len, Some(hdr.record_type)))
         }
     }
 }
 
-fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, record_payload_len: u16) -> Result<()> {
+fn validate_tls_record(record: &[u8], source: &str, record_type: TlsRecordType, record_payload_len: u16) -> Result<()> {
+    match record_type {
+        TlsRecordType::Handshake => {
+            if record_payload_len < 4 {
+                bail!("{} sent too short Handshake record: {} bytes", source, record_payload_len);
+            }
+        }
+        TlsRecordType::ChangeCipherSpec => {
+            if record_payload_len != 1 {
+                bail!("{} sent invalid ChangeCipherSpec record: {} bytes", source, record_payload_len);
+            }
+        }
+        TlsRecordType::Alert => {
+            if record_payload_len != 2 {
+                bail!("{} sent invalid Alert record: {} bytes", source, record_payload_len);
+            }
+        }
+        TlsRecordType::Heartbeat => {} // No specific length check for Heartbeat header itself relative to constant
+        TlsRecordType::ApplicationData => {} // Should not happen given caller structure, but safe to ignore
+        _ => {
+            bail!("{} sent invalid or unsupported TLS record type: {}", source, record_type.0);
+        }
+    }
+
     match parse_tls_plaintext(record) {
         Ok((_, plaintext)) => {
             for msg in &plaintext.msg {

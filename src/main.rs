@@ -171,7 +171,7 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                 client_buf.extend_from_slice(&client_temp_buf[..n]);
                 
                 loop {
-                    let (consumed, record_type) = tls::process_tls_buffer(&client_buf, "Client")?;
+                    let (consumed, _) = tls::process_tls_buffer(&client_buf, "Client")?;
                     if consumed == 0 {
                         break;
                     }
