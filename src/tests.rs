@@ -321,6 +321,62 @@ async fn test_upstream_timeout() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_abort_on_malformed_handshake_body() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Setup Dummy Upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    let _upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        // Skip STARTTLS
+        let mut h = [0u8; 4];
+        socket.read_exact(&mut h).await.unwrap();
+        let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+        let mut b = vec![0u8; l];
+        socket.read_exact(&mut b).await.unwrap();
+        // Reply success
+        let r_header = (16u32 | 0x80000000).to_be_bytes();
+        socket.write_all(&r_header).await.unwrap();
+        let r_payload = [0u8; 16];
+        socket.write_all(&r_payload).await.unwrap();
+    });
+
+    // 2. Start Proxy
+    let proxy_addr = spawn_proxy(upstream_addr).await?;
+
+    // 3. Client Interaction: Send Valid STARTTLS
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let xdr_frame = encode_starttls_rpc(100235);
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    AsyncWriteExt::write_u32(&mut client, len).await?;
+    client.write_all(&xdr_frame).await?;
+
+    // Read reply
+    let mut h = [0u8; 4];
+    client.read_exact(&mut h).await?;
+    let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+    let mut b = vec![0u8; l];
+    client.read_exact(&mut b).await?;
+
+    // 4. Send record type HANDSHAKE (22) but with complete garbage body
+    let malformed_handshake = [
+        0x16,       // Handshake
+        0x03, 0x03, // TLS 1.2
+        0x00, 0x05, // Length: 5
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Garbage handshake data
+    ];
+    client.write_all(&malformed_handshake).await?;
+
+    // 5. Verify Proxy Aborted
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await?;
+    assert_eq!(n, 0, "Proxy should have closed connection due to malformed handshake body");
+
+    Ok(())
+}
+
 fn setup_tls_configs() -> (TlsAcceptor, TlsConnector) {
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();

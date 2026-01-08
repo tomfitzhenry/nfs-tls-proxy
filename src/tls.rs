@@ -21,13 +21,23 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                         Ok((_, plaintext)) => {
                             log::debug!("Parsed {} handshake: Len={}", source, plaintext.hdr.len);
                         }
-                        Err(_) => {
-                            // Handshake might be encrypted (TLS 1.3) or just malformed for the parser.
-                            log::debug!(
-                                "Forwarding {} opaque or encrypted handshake: Len={}",
-                                source,
-                                hdr.len
-                            );
+                        Err(e) => {
+                            // Handshake might be encrypted (TLS 1.3), but if it's plaintext Handshake,
+                            // we expect it to be parseable. In practice, tls-parser might fail on
+                            // encrypted records if it tries to parse them as plaintext.
+                            // However, we want to be strict where possible.
+                            // We'll bail if it's truly malformed handshake data that isn't encrypted.
+                            log::debug!("{} handshake parsing issue (potentially encrypted): {:?}", source, e);
+                            
+                            // For security, we should distinguish between "encrypted" and "malformed".
+                            // If we can't parse it, and we are during the initial stages where
+                            // we expect plaintext, this is an issue.
+                            // However, to keep it simple and safe for TLS 1.3, we'll only bail if
+                            // we're CERTAIN it should be plaintext.
+                            // For now, let's keep it as is but add a comment, OR be strict if we see
+                            // very obvious garbage.
+                            // Actually, let's follow the plan: "treat parsing errors as fatal".
+                            bail!("{} sent malformed or unsupported handshake data: {:?}", source, e);
                         }
                     }
                 } else {
@@ -84,9 +94,9 @@ mod tests {
 
     #[test]
     fn test_process_tls_buffer_handshake() {
-        // Simple Handshake header (ClientHello-like)
+        // Simple Handshake header (HelloRequest)
         let mut buf = vec![0x16, 0x03, 0x03, 0x00, 0x04];
-        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 4 bytes of "handshake"
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // HelloRequest (Type 0, Length 0)
         let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 9);
         assert!(!hit_app_data);
@@ -103,8 +113,8 @@ mod tests {
 
     #[test]
     fn test_process_tls_buffer_multiple_records() {
-        let mut buf = vec![0x16, 0x03, 0x03, 0x00, 0x04]; // Handshake
-        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let mut buf = vec![0x16, 0x03, 0x03, 0x00, 0x04]; // Handshake (HelloRequest)
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         buf.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x02]); // App Data
         buf.extend_from_slice(&[0x05, 0x06]);
         
