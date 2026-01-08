@@ -111,8 +111,12 @@ async fn test_full_proxy_flow_real_tls() -> Result<()> {
     let n = tls_stream.read(&mut buf).await?;
     assert_eq!(&buf[..n], b"Hello World");
 
-    // Cleanup
+    // Explicitly shutdown to end splicing and trigger handles to finish
+    tls_stream.get_mut().0.shutdown().await?;
+    
     let _ = upstream_handle.await;
+    // We don't necessarily need to await proxy_handle if it's just a listener loop, 
+    // but our specific spawned task should finish.
     let _ = proxy_handle.await;
     
     Ok(())
