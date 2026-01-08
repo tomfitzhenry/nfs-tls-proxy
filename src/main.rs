@@ -2,11 +2,10 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordType};
 use bytes::BytesMut;
 use std::time::Duration;
 use tokio::time::timeout;
-
+mod tls;
 mod xdr;
 #[cfg(test)]
 mod tests;
@@ -169,7 +168,7 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                 }
                 client_buf.extend_from_slice(&client_temp_buf[..n]);
                 
-                let (consumed, hit_app_data) = process_tls_buffer(&client_buf, "Client")?;
+                let (consumed, hit_app_data) = tls::process_tls_buffer(&client_buf, "Client")?;
                 
                 if consumed > 0 {
                     let data = client_buf.split_to(consumed);
@@ -187,7 +186,7 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                 }
                 upstream_buf.extend_from_slice(&upstream_temp_buf[..n]);
                 
-                let (consumed, hit_app_data) = process_tls_buffer(&upstream_buf, "Upstream")?;
+                let (consumed, hit_app_data) = tls::process_tls_buffer(&upstream_buf, "Upstream")?;
                 
                 if consumed > 0 {
                     let data = upstream_buf.split_to(consumed);
@@ -203,64 +202,3 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
     }
 }
 
-fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
-    let mut offset = 0;
-    let mut found_app_data = false;
-
-    loop {
-        let remaining = &buf[offset..];
-        if remaining.is_empty() {
-            break;
-        }
-
-        // Try to parse as plaintext first (to inspect handshake messages)
-        match parse_tls_plaintext(remaining) {
-            Ok((rem, plaintext)) => {
-                let consumed = remaining.len() - rem.len();
-                log::debug!("Parsed {} record: Type={:?}, Len={}", source, plaintext.hdr.record_type, plaintext.hdr.len);
-                
-                if plaintext.hdr.record_type == TlsRecordType::ApplicationData {
-                    found_app_data = true;
-                }
-                
-                offset += consumed;
-                
-                if found_app_data {
-                    return Ok((offset, true));
-                }
-            }
-            Err(tls_parser::Err::Incomplete(_)) => {
-                break; // Need more data
-            }
-            Err(_) => {
-                // Background: if parse_tls_plaintext fails, it might be an encrypted record (e.g. TLS 1.3 after ServerHello).
-                // We fallback to just parsing the record header to advance and check for ApplicationData.
-                match parse_tls_record_header(remaining) {
-                    Ok((_, hdr)) => {
-                        let total_record_len = 5 + hdr.len as usize;
-                        if remaining.len() < total_record_len {
-                            break; // Need more data for the full record
-                        }
-                        
-                        log::debug!("Forwarding {} encrypted record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
-                        
-                        if hdr.record_type == TlsRecordType::ApplicationData {
-                            found_app_data = true;
-                        }
-                        
-                        offset += total_record_len;
-                        
-                        if found_app_data {
-                            return Ok((offset, true));
-                        }
-                    }
-                    Err(e) => {
-                        bail!("{} sent truly invalid TLS data: {:?}", source, e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((offset, false))
-}
