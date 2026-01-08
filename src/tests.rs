@@ -178,6 +178,149 @@ async fn test_abort_on_wonky_tls_handshake() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_abort_on_multifragment_starttls() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Start Dummy Upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    let _upstream_handle = tokio::spawn(async move {
+        let _ = upstream_listener.accept().await;
+    });
+
+    // 2. Start Proxy
+    let proxy_addr = spawn_proxy(upstream_addr).await?;
+
+    // 3. Client Interaction: Send STARTTLS with is_last=false
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let xdr_frame = encode_starttls_rpc(100235);
+    let len = xdr_frame.len() as u32 & 0x7FFFFFFF; // Clear the highest bit (is_last = false)
+    let _ = AsyncWriteExt::write_u32(&mut client, len).await;
+    let _ = client.write_all(&xdr_frame).await;
+
+    // 4. Verify Proxy Aborted
+    let mut buf = [0u8; 1];
+    let res = client.read(&mut buf).await;
+    match res {
+        Ok(n) => assert_eq!(n, 0, "Proxy should have closed connection due to multi-fragment RPC"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "Expected connection reset"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_abort_on_oversized_starttls() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Start Dummy Upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    let _upstream_handle = tokio::spawn(async move {
+        let _ = upstream_listener.accept().await;
+    });
+
+    // 2. Start Proxy
+    let proxy_addr = spawn_proxy(upstream_addr).await?;
+
+    // 3. Client Interaction: Send OVERSIZED STARTTLS (> 1024 bytes)
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let xdr_frame = vec![0u8; 1025]; 
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    let _ = AsyncWriteExt::write_u32(&mut client, len).await;
+    let _ = client.write_all(&xdr_frame).await;
+
+    // 4. Verify Proxy Aborted
+    let mut buf = [0u8; 1];
+    let res = client.read(&mut buf).await;
+    match res {
+        Ok(n) => assert_eq!(n, 0, "Proxy should have closed connection due to oversized XDR"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "Expected connection reset"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_abort_on_oversized_tls_record() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Setup Dummy Upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    let _upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        // Skip STARTTLS
+        let mut h = [0u8; 4];
+        socket.read_exact(&mut h).await.unwrap();
+        let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+        let mut b = vec![0u8; l];
+        socket.read_exact(&mut b).await.unwrap();
+        // Reply success
+        let r_header = (16u32 | 0x80000000).to_be_bytes();
+        socket.write_all(&r_header).await.unwrap();
+        let r_payload = [0u8; 16];
+        socket.write_all(&r_payload).await.unwrap();
+    });
+
+    // 2. Start Proxy
+    let proxy_addr = spawn_proxy(upstream_addr).await?;
+
+    // 3. Client Interaction: Send Valid STARTTLS
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let xdr_frame = encode_starttls_rpc(100235);
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    AsyncWriteExt::write_u32(&mut client, len).await?;
+    client.write_all(&xdr_frame).await?;
+
+    // Read reply
+    let mut h = [0u8; 4];
+    client.read_exact(&mut h).await?;
+    let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+    let mut b = vec![0u8; l];
+    client.read_exact(&mut b).await?;
+
+    // 4. Send OVERSIZED TLS record (> 16KB + 2KB)
+    let oversized_len: u16 = 0xFFFF; // 64KB
+    let mut oversized_record = vec![0u8; 5 + oversized_len as usize];
+    oversized_record[0] = 22; // Handshake
+    oversized_record[1] = 0x03;
+    oversized_record[2] = 0x03;
+    let len_bytes = oversized_len.to_be_bytes();
+    oversized_record[3] = len_bytes[0];
+    oversized_record[4] = len_bytes[1];
+    
+    client.write_all(&oversized_record).await?;
+
+    // 5. Verify Proxy Aborted
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await?;
+    assert_eq!(n, 0, "Proxy should have closed connection due to oversized TLS record");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_upstream_timeout() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Point proxy to a non-existent or blackholed address
+    // 192.0.2.1 is TEST-NET-1, reserved for documentation, often non-routable.
+    let proxy_addr = spawn_proxy("192.0.2.1:20000".to_string()).await?;
+
+    // 2. Client Interaction
+    let client = TcpStream::connect(&proxy_addr).await;
+    if let Ok(mut socket) = client {
+        // The proxy handle_connection will fail after its internal timeout (5s)
+        let mut buf = [0u8; 1];
+        let n = socket.read(&mut buf).await?;
+        assert_eq!(n, 0, "Proxy should have closed connection due to upstream timeout");
+    }
+
+    Ok(())
+}
+
 fn setup_tls_configs() -> (TlsAcceptor, TlsConnector) {
     let subject_alt_names = vec!["localhost".to_string()];
     let cert = generate_simple_self_signed(subject_alt_names).unwrap();
