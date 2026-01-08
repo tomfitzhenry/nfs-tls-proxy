@@ -1,30 +1,20 @@
 use anyhow::{bail, Result};
-use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordType};
+use nom::bytes::streaming::take;
+use nom::{Err as NomErr, IResult};
+use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordHeader, TlsRecordType};
 
 pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
-    let mut offset = 0;
+    let mut input = buf;
     let mut found_app_data = false;
 
-    loop {
-        let remaining = &buf[offset..];
-        if remaining.is_empty() {
-            break;
-        }
-
-        match parse_tls_record_header(remaining) {
-            Ok((_, hdr)) => {
-                let total_record_len = 5 + hdr.len as usize;
-                if remaining.len() < total_record_len {
-                    break; // Need more data for the full record
-                }
-
+    while !input.is_empty() {
+        match parse_record_envelope(input) {
+            Ok((remaining, (hdr, record_data))) => {
                 // Sanity check: valid record type (20-24)
                 let raw_type = hdr.record_type.0;
-                if raw_type < 20 || raw_type > 24 {
+                if !(20..=24).contains(&raw_type) {
                     bail!("{} sent invalid TLS record type: {}", source, raw_type);
                 }
-
-                let record_data = &remaining[..total_record_len];
 
                 if hdr.record_type == TlsRecordType::Handshake {
                     match parse_tls_plaintext(record_data) {
@@ -33,26 +23,34 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                         }
                         Err(_) => {
                             // Handshake might be encrypted (TLS 1.3) or just malformed for the parser.
-                            // We don't bail here, just treat it as an opaque record.
-                            log::debug!("Forwarding {} opaque or encrypted handshake: Len={}", source, hdr.len);
+                            log::debug!(
+                                "Forwarding {} opaque or encrypted handshake: Len={}",
+                                source,
+                                hdr.len
+                            );
                         }
                     }
                 } else {
-                    log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
+                    log::debug!(
+                        "Forwarding {} record: Type={:?}, Len={}",
+                        source,
+                        hdr.record_type,
+                        hdr.len
+                    );
                 }
 
                 if hdr.record_type == TlsRecordType::ApplicationData {
                     found_app_data = true;
                 }
 
-                offset += total_record_len;
+                input = remaining;
 
                 if found_app_data {
-                    return Ok((offset, true));
+                    break;
                 }
             }
-            Err(tls_parser::Err::Incomplete(_)) => {
-                break; // Need more data for header
+            Err(NomErr::Incomplete(_)) => {
+                break; // Need more data
             }
             Err(e) => {
                 bail!("{} sent truly invalid TLS data: {:?}", source, e);
@@ -60,7 +58,16 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
         }
     }
 
-    Ok((offset, false))
+    let consumed = buf.len() - input.len();
+    Ok((consumed, found_app_data))
+}
+
+fn parse_record_envelope(i: &[u8]) -> IResult<&[u8], (TlsRecordHeader, &[u8])> {
+    let start = i;
+    let (i, hdr) = parse_tls_record_header(i)?;
+    let (i, _) = take(hdr.len)(i)?;
+    let consumed = start.len() - i.len();
+    Ok((i, (hdr, &start[..consumed])))
 }
 
 #[cfg(test)]
