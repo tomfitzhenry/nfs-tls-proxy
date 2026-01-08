@@ -425,3 +425,88 @@ fn encode_starttls_rpc(program: u32) -> Vec<u8> {
     WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0).unwrap(); // proc 0
     xdr_frame
 }
+
+#[tokio::test]
+async fn test_client_application_data_ignored() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    
+    // 1. Setup Dummy Upstream (Should NOT send ApplicationData)
+    // We want the proxy to hang waiting for the upstream, not finish early because of the client.
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        // Skip STARTTLS
+        let mut h = [0u8; 4];
+        socket.read_exact(&mut h).await.unwrap();
+        let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+        let mut b = vec![0u8; l];
+        socket.read_exact(&mut b).await.unwrap();
+        // Reply success
+        let r_header = (16u32 | 0x80000000).to_be_bytes();
+        socket.write_all(&r_header).await.unwrap();
+        let r_payload = [0u8; 16];
+        socket.write_all(&r_payload).await.unwrap();
+        
+        // Just read from client forever, never sending Application Data back
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 { break; }
+        }
+    });
+
+    // 2. Start Proxy
+    let proxy_addr = spawn_proxy(upstream_addr).await?;
+
+    // 3. Client Interaction: Send Valid STARTTLS
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+    let xdr_frame = encode_starttls_rpc(100235);
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    AsyncWriteExt::write_u32(&mut client, len).await?;
+    client.write_all(&xdr_frame).await?;
+
+    // Read reply
+    let mut h = [0u8; 4];
+    client.read_exact(&mut h).await?;
+    let l = (u32::from_be_bytes(h) & 0x7FFFFFFF) as usize;
+    let mut b = vec![0u8; l];
+    client.read_exact(&mut b).await?;
+
+    // 4. Send FAKE TLS Application Data Record from Client
+    // If the proxy mistakenly trusts the client, it will see this "Application Data" 
+    // and assume the handshake is finished, returning from validate_tls_handshake.
+    // The main loop would then (in a real scenario) splice, or in our test harness, 
+    // it effectively 'succeeds' the handshake step and enters splice mode (where validation is off).
+    
+    let fake_app_data_record = [
+        0x17,       // Application Data
+        0x03, 0x03, // TLS 1.2
+        0x00, 0x05, // Length: 5
+        0x48, 0x65, 0x6C, 0x6C, 0x6F, // "Hello"
+    ];
+    client.write_all(&fake_app_data_record).await?;
+
+    // 5. Send GARBAGE data
+    // We send a complete record header (5 bytes) + payload (5 bytes) but with invalid Type (0xFF).
+    // This should trigger an immediate parsing error and connection close, rather than a timeout.
+    // If we only sent 4 bytes, the proxy would wait for the 5th byte (Incomplete) until the 30s handshake timeout.
+    
+    let garbage = [
+        0xFF,       // Invalid Type
+        0x03, 0x03, // TLS 1.2
+        0x00, 0x05, // Length 5
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF // Junk
+    ];
+    client.write_all(&garbage).await?;
+    
+    // Check client socket for closure.
+    // We expect a short/immediate read of 0 (EOF) indicating closure.
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await?;
+    assert_eq!(n, 0, "Proxy should have validated the garbage data and closed connection (proof it did NOT switch to splicing early)");
+    
+    let _ = upstream_handle.await;
+    Ok(())
+}

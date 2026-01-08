@@ -178,10 +178,6 @@ async fn validate_tls_handshake(client_socket: &mut TcpStream, upstream_socket: 
                     
                     let data = client_buf.split_to(consumed);
                     upstream_socket.write_all(&data).await?;
-                    
-                    if let Some(TlsRecordType::ApplicationData) = record_type {
-                        log::info!("Client sent Application Data.");
-                    }
                 }
             }
             res = upstream_socket.read(&mut upstream_temp_buf) => {
