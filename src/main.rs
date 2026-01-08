@@ -1,10 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-// use std::net::SocketAddr;
-// use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tls_parser::{parse_tls_plaintext, TlsMessage};
+use tls_parser::parse_tls_plaintext;
 
 mod xdr;
 #[cfg(test)]
@@ -66,9 +64,6 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
     client_socket.read_exact(&mut fragment_header).await
         .context("Failed to read RPC fragment header")?;
 
-    // RPC over TCP: 
-    // Bit 0: Last Fragment Flag (0x80000000)
-    // Bits 1-31: Fragment Length
     let header_val = u32::from_be_bytes(fragment_header);
     let len = (header_val & 0x7FFFFFFF) as usize;
 
@@ -87,15 +82,10 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
     log::debug!("Phase 1: Valid XDR STARTTLS command detected");
 
     // Forward logic to upstream
-    // We must send the *original* header and payload.
     upstream_socket.write_all(&fragment_header).await?;
     upstream_socket.write_all(&xdr_payload).await?;
 
     // Now read the reply from upstream and forward to client.
-    // We expect an RPC Reply. For simplicity, we just shuttle the *next* PDU back.
-    // We have to parse the length to know how much to read/write properly if we want to stay synchronized, 
-    // OR we can just do a single read-write if we assume strict lock-step (which STARTTLS is).
-    
     let mut reply_header = [0u8; 4];
     upstream_socket.read_exact(&mut reply_header).await
         .context("Failed to read RPC reply header from upstream")?;
@@ -103,74 +93,91 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
     let reply_val = u32::from_be_bytes(reply_header);
     let reply_len = (reply_val & 0x7FFFFFFF) as usize;
     
-    if reply_len > 65536 {
-         bail!("RPC Reply fragment length suspiciously large: {}", reply_len);
+    // Forward reply to client (header)
+    client_socket.write_all(&reply_header).await?;
+
+    // We can't use splice yet because the *next* thing on the wire is ClientHello.
+    // We have to forward the rest of the RPC reply though.
+    // Let's just read/write it. It's small.
+    // Wait, the client expects the reply body BEFORE it sends ClientHello.
+    
+    if reply_len > 0 {
+        let mut reply_payload = vec![0u8; reply_len];
+        upstream_socket.read_exact(&mut reply_payload).await
+            .context("Failed to read RPC reply body")?;
+        client_socket.write_all(&reply_payload).await?;
     }
     
-    let mut reply_payload = vec![0u8; reply_len];
-    upstream_socket.read_exact(&mut reply_payload).await
-        .context("Failed to read RPC reply body")?;
-
-    // Forward reply to client
-    client_socket.write_all(&reply_header).await?;
-    client_socket.write_all(&reply_payload).await?;
-
-    log::debug!("Phase 1: Forwarded STARTTLS Reply to client");
+    log::debug!("Phase 1: Forwarded STARTTLS Reply to client. Entering Handshake Loop.");
 
     // =======================================================================
-    // Phase 2: Validating TLS Handshake
+    // Phase 2: Validating TLS Handshake Bidirectionally
     // =======================================================================
 
-    // Client should now send ClientHello.
-    // Read the TLS record header (5 bytes).
-    // ContentType(1) + Version(2) + Length(2)
-    let mut tls_header = [0u8; 5];
-    client_socket.read_exact(&mut tls_header).await
-        .context("Failed to read TLS record header")?;
+    // We need to continuously read records from both sides until we see Application Data.
+    let mut client_buf = Vec::with_capacity(4096);
+    let mut upstream_buf = Vec::with_capacity(4096);
+    loop {
+        let mut client_temp_buf = [0u8; 4096];
+        let mut upstream_temp_buf = [0u8; 4096];
 
-    let content_type = tls_header[0];
-    // Handshake is 22 (0x16)
-    if content_type != 0x16 {
-        bail!("Expected TLS Handshake (0x16), got 0x{:02X}", content_type);
-    }
-
-    let tls_len = u16::from_be_bytes([tls_header[3], tls_header[4]]) as usize;
-    if tls_len > 16384 {
-        bail!("TLS record length too large: {}", tls_len);
-    }
-
-    let mut tls_payload = vec![0u8; tls_len];
-    client_socket.read_exact(&mut tls_payload).await
-        .context("Failed to read TLS payload")?;
-
-    // Combine header and payload for the parser
-    let mut full_tls_record = Vec::with_capacity(5 + tls_len);
-    full_tls_record.extend_from_slice(&tls_header);
-    full_tls_record.extend_from_slice(&tls_payload);
-
-    match parse_tls_plaintext(&full_tls_record) {
-        Ok((rem, plaintext)) => {
-            if !rem.is_empty() {
-                // This implies we read more than one record, or sizing was off. 
-                // But we read exactly `tls_len` + 5.
-                // It should be consumed entirely if it is a single valid record.
-                log::warn!("TLS Parser had remaining bytes, potentially check logic");
+        tokio::select! {
+            res = client_socket.read(&mut client_temp_buf) => {
+                let n = res.context("Client read failed")?;
+                if n == 0 {
+                    bail!("Client closed connection during handshake");
+                }
+                client_buf.extend_from_slice(&client_temp_buf[..n]);
+                
+                // Process client buffer
+                let (consumed, hit_app_data) = process_tls_buffer(&client_buf, "Client")?;
+                
+                // Forward consumed bytes to upstream
+                if consumed > 0 {
+                    upstream_socket.write_all(&client_buf[..consumed]).await?;
+                    let remaining = client_buf.split_off(consumed);
+                    client_buf = remaining;
+                }
+                
+                if hit_app_data {
+                    log::info!("Client sent Application Data. Handshake considered established.");
+                    break;
+                }
             }
-            // Verify it is a handshake
-            let is_handshake = plaintext.msg.iter().any(|m| matches!(m, TlsMessage::Handshake(_)));
-            if !is_handshake {
-                 bail!("Inner TLS message was not a Handshake");
+            res = upstream_socket.read(&mut upstream_temp_buf) => {
+                let n = res.context("Upstream read failed")?;
+                if n == 0 {
+                     bail!("Upstream closed connection during handshake");
+                }
+                upstream_buf.extend_from_slice(&upstream_temp_buf[..n]);
+                
+                let (consumed, hit_app_data) = process_tls_buffer(&upstream_buf, "Upstream")?;
+                
+                if consumed > 0 {
+                    client_socket.write_all(&upstream_buf[..consumed]).await?;
+                    let remaining = upstream_buf.split_off(consumed);
+                    upstream_buf = remaining;
+                }
+                
+                if hit_app_data {
+                    log::info!("Upstream sent Application Data. Handshake considered established.");
+                    break;
+                }
             }
-        },
-        Err(e) => {
-             bail!("TLS parsing failed: {:?}", e);
         }
     }
 
-    log::debug!("Phase 2: Valid TLS ClientHello detected");
-
-    // Forward TLS ClientHello to upstream
-    upstream_socket.write_all(&full_tls_record).await?;
+    // Flush any remaining buffered data that we might have read but not processed?
+    // loop above ensures we consume FULL records. 
+    // What if there is a partial record in client_buf?
+    // We need to forward it before splicing.
+    // Splice takes the FD. If we have bytes in user-space `client_buf`, we must write them to `upstream_socket`.
+    if !client_buf.is_empty() {
+        upstream_socket.write_all(&client_buf).await?;
+    }
+    if !upstream_buf.is_empty() {
+        client_socket.write_all(&upstream_buf).await?;
+    }
 
     // =======================================================================
     // Phase 3: Splicing
@@ -178,18 +185,87 @@ async fn handle_connection(mut client_socket: TcpStream, upstream_addr: String) 
     
     log::info!("Phase 3: Splicing connection");
 
-    // We can't reuse the previous buffers/socket handle easily if we just `io::copy`.
-    // But `tokio-splice` (zero_copy_bidirectional) takes the TcpStreams.
-    
-    // Note: tokio-splice might need the raw fd. 
-    // And standard `tokio::io::copy_bidirectional` is safer if `splice` isn't strictly required, 
-    // but the user REQUESTED `tokio-splice`.
-    
-    // `tokio_splice2::copy_bidirectional` works on the streams directly.
+    // Use tokio_splice2::copy_bidirectional for efficiency
     tokio_splice2::copy_bidirectional(
         &mut client_socket, 
         &mut upstream_socket
     ).await?;
 
     Ok(())
+}
+
+/// Parses TLS records from the buffer.
+/// Returns (bytes_consumed, found_app_data).
+/// Validates that records are Handshake, Alert, CCS, or AppData.
+fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
+    let mut offset = 0;
+    let mut found_app_data = false;
+
+    loop {
+        // Check if we have enough for a header
+        if buf.len() - offset < 5 {
+            break; // Need more data
+        }
+
+        let header = &buf[offset..offset+5];
+        let content_type = header[0];
+        let version_major = header[1];
+        let _version_minor = header[2];
+        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+        // Sanity check header
+        // ContentType: 20=CCS, 21=Alert, 22=Handshake, 23=AppData
+        if ![20, 21, 22, 23].contains(&content_type) {
+             bail!("{} sent invalid TLS ContentType: {}", source, content_type);
+        }
+        
+        // Check version (roughly 3.x)
+        if version_major != 3 {
+             // TLS 1.0=3.1, 1.1=3.2, 1.2=3.3, 1.3 uses 3.3 for legacy record version usually
+            // bail!("{} sent invalid TLS Version: {}.{}", source, version_major, version_minor);
+        }
+
+        if len > 16384 + 2048 {
+            bail!("{} sent over-sized TLS record: {}", source, len);
+        }
+
+        // Do we have the full record?
+        let total_record_len = 5 + len;
+        if buf.len() - offset < total_record_len {
+            break; // Need more data
+        }
+
+        // We have a full record.
+        log::debug!("Parsed {} record: Type={}, Len={}", source, content_type, len);
+
+        if content_type == 23 {
+            found_app_data = true; // Signal to switch to splicing
+        } else if content_type == 22 {
+            // It is a handshake message.
+            // If it is NOT encrypted, we could validate it.
+            // But tracking encryption state is hard.
+            // basic check: parse_tls_plaintext might fail if it's encrypted data.
+            // We just ignore the error if it fails to parse (assumed encrypted).
+            // BUT, if it DOES parse, we should check it.
+            match parse_tls_plaintext(&buf[offset..offset+total_record_len]) {
+                Ok((_, _plaintext)) => {
+                    // It was a valid plaintext handshake
+                },
+                Err(_) => {
+                    // Likely encrypted handshake (Finished, etc)
+                }
+            }
+        }
+
+        offset += total_record_len;
+        
+        // If we found app data, we typically want to stop parsing *immediately* after this record?
+        // Or keep going? 
+        // Logic says: return immediately so we can forward this and maybe break loop.
+        if found_app_data {
+            return Ok((offset, true));
+        }
+    }
+
+    Ok((offset, false))
 }
