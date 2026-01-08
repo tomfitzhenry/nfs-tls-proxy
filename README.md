@@ -15,6 +15,14 @@ A Rust-based transparent proxy designed to sit in front of a Linux kernel NFS se
 2. **Phase 2: Handshake Loop**: Intercepts and parses all TLS records (Handshake, Alert, CCS). Validates record structure and header integrity.
 3. **Phase 3: Splice**: Upon detecting the first `ApplicationData` record, the proxy flushes its buffers and offloads the remaining stream to the kernel using zero-copy splicing.
 
+## Threat Model
+
+The primary threat addressed by this proxy is a remote attacker attempting to exploit the Linux kernel's NFS server (`nfsd`) via malformed network input, specifically targeting:
+1. **XDR Parsing**: Vulnerabilities in the kernel's parsing of the initial RPC calls.
+2. **TLS Handshake**: Bugs in the kernel's handling of the TLS handshake machinery before a secure channel is fully established.
+
+By validating the `STARTTLS` sequence and the integrity of the TLS record headers in userspace, this proxy ensures that only compliant, expected protocol sequences reach the kernel. Malformed exploits attempting to trigger RCE (Remote Code Execution) or memory corruption in the kernel's pre-auth path are dropped at the proxy level.
+
 ## Usage
 
 ### Prerequisites
