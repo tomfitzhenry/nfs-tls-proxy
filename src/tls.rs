@@ -12,6 +12,16 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
             Err(e) => bail!("{} sent truly invalid TLS data: {:?}", source, e),
         };
 
+        // RFC 5246/8446: Max record length is 2^14 bytes (16384)
+        if hdr.len > 16384 {
+            bail!("{} sent oversized TLS record: {} bytes", source, hdr.len);
+        }
+
+        // Sanity check version: 0x0301 (TLS 1.0) or higher.
+        if hdr.version.0 < 0x0301 {
+            bail!("{} sent unsupported TLS version: 0x{:04x}", source, hdr.version.0);
+        }
+
         let record_len = 5 + hdr.len as usize;
         if input.len() < record_len {
             break;
@@ -23,12 +33,26 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                 log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
                 return Ok((offset + record_len, true));
             }
-            TlsRecordType::Handshake | TlsRecordType::ChangeCipherSpec | TlsRecordType::Alert | TlsRecordType::Heartbeat => {
-                if let Err(e) = parse_tls_plaintext(record) {
-                    log::debug!("{} {:?} parsing issue (potentially encrypted): {:?}", source, hdr.record_type, e);
-                    bail!("{} sent malformed or unsupported {:?} data: {:?}", source, hdr.record_type, e);
+            TlsRecordType::Handshake => {
+                if hdr.len < 4 {
+                    bail!("{} sent too short Handshake record: {} bytes", source, hdr.len);
                 }
-                log::debug!("Parsed {} {:?}: Len={}", source, hdr.record_type, hdr.len);
+                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            }
+            TlsRecordType::ChangeCipherSpec => {
+                if hdr.len != 1 {
+                    bail!("{} sent invalid ChangeCipherSpec record: {} bytes", source, hdr.len);
+                }
+                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            }
+            TlsRecordType::Alert => {
+                if hdr.len != 2 {
+                    bail!("{} sent invalid Alert record: {} bytes", source, hdr.len);
+                }
+                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
+            }
+            TlsRecordType::Heartbeat => {
+                validate_plaintext(record, source, hdr.record_type, hdr.len)?;
             }
             _ => {
                 bail!("{} sent invalid or unsupported TLS record type: {}", source, hdr.record_type.0);
@@ -38,6 +62,15 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
     }
 
     Ok((offset, false))
+}
+
+fn validate_plaintext(record: &[u8], source: &str, record_type: TlsRecordType, len: u16) -> Result<()> {
+    if let Err(e) = parse_tls_plaintext(record) {
+        log::debug!("{} {:?} parsing issue (potentially encrypted): {:?}", source, record_type, e);
+        bail!("{} sent malformed or unsupported {:?} data: {:?}", source, record_type, e);
+    }
+    log::debug!("Parsed {} {:?}: Len={}", source, record_type, len);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -128,5 +161,38 @@ mod tests {
         let buf = [0x00, 0x03, 0x03, 0x00, 0x01, 0xFF];
         let res = process_tls_buffer(&buf, "Test");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_process_tls_buffer_oversized_record() {
+        let mut buf = vec![0x16, 0x03, 0x03, 0x40, 0x01]; // Length 16385 (0x4001)
+        buf.resize(5 + 16385, 0);
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("oversized"));
+    }
+
+    #[test]
+    fn test_process_tls_buffer_invalid_version() {
+        let buf = [0x16, 0x03, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00]; // SSL 3.0
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("unsupported TLS version"));
+    }
+
+    #[test]
+    fn test_process_tls_buffer_handshake_too_short() {
+        let buf = [0x16, 0x03, 0x03, 0x00, 0x03, 0x00, 0x00, 0x00]; // Handshake length 3 (min 4)
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("too short Handshake record"));
+    }
+
+    #[test]
+    fn test_process_tls_buffer_alert_wrong_size() {
+        let buf = [0x15, 0x03, 0x03, 0x00, 0x03, 0x02, 0x00, 0x00]; // Alert length 3 (must be 2)
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("invalid Alert record"));
     }
 }
