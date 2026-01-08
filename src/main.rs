@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tls_parser::parse_tls_plaintext;
+use tls_parser::{parse_tls_plaintext, parse_tls_record_header, TlsRecordType};
 use bytes::BytesMut;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -208,53 +208,57 @@ fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
     let mut found_app_data = false;
 
     loop {
-        // Check if we have enough for a header
-        if buf.len() - offset < 5 {
-            break; // Need more data
+        let remaining = &buf[offset..];
+        if remaining.is_empty() {
+            break;
         }
 
-        let header = &buf[offset..offset+5];
-        let content_type = header[0];
-        let version_major = header[1];
-        let _version_minor = header[2];
-        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
-
-        // ContentType: 20=CCS, 21=Alert, 22=Handshake, 23=AppData
-        if ![20, 21, 22, 23].contains(&content_type) {
-             bail!("{} sent invalid TLS ContentType: {}", source, content_type);
-        }
-        
-        // Check version (roughly 3.x)
-        if version_major != 3 {
-            // TLS 1.x uses 3.x for legacy record version
-        }
-
-        if len > 16384 + 2048 {
-            bail!("{} sent over-sized TLS record: {}", source, len);
-        }
-
-        // Do we have the full record?
-        let total_record_len = 5 + len;
-        if buf.len() - offset < total_record_len {
-            break; // Need more data
-        }
-
-        // We have a full record.
-        log::debug!("Parsed {} record: Type={}, Len={}", source, content_type, len);
-
-        if content_type == 23 {
-            found_app_data = true;
-        } else if content_type == 22 {
-            // It is a handshake message.
-            if let Ok((_, _plaintext)) = parse_tls_plaintext(&buf[offset..offset+total_record_len]) {
-                // Valid plaintext handshake
+        // Try to parse as plaintext first (to inspect handshake messages)
+        match parse_tls_plaintext(remaining) {
+            Ok((rem, plaintext)) => {
+                let consumed = remaining.len() - rem.len();
+                log::debug!("Parsed {} record: Type={:?}, Len={}", source, plaintext.hdr.record_type, plaintext.hdr.len);
+                
+                if plaintext.hdr.record_type == TlsRecordType::ApplicationData {
+                    found_app_data = true;
+                }
+                
+                offset += consumed;
+                
+                if found_app_data {
+                    return Ok((offset, true));
+                }
             }
-        }
-
-        offset += total_record_len;
-        
-        if found_app_data {
-            return Ok((offset, true));
+            Err(tls_parser::Err::Incomplete(_)) => {
+                break; // Need more data
+            }
+            Err(_) => {
+                // Background: if parse_tls_plaintext fails, it might be an encrypted record (e.g. TLS 1.3 after ServerHello).
+                // We fallback to just parsing the record header to advance and check for ApplicationData.
+                match parse_tls_record_header(remaining) {
+                    Ok((_, hdr)) => {
+                        let total_record_len = 5 + hdr.len as usize;
+                        if remaining.len() < total_record_len {
+                            break; // Need more data for the full record
+                        }
+                        
+                        log::debug!("Forwarding {} encrypted record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
+                        
+                        if hdr.record_type == TlsRecordType::ApplicationData {
+                            found_app_data = true;
+                        }
+                        
+                        offset += total_record_len;
+                        
+                        if found_app_data {
+                            return Ok((offset, true));
+                        }
+                    }
+                    Err(e) => {
+                        bail!("{} sent truly invalid TLS data: {:?}", source, e);
+                    }
+                }
+            }
         }
     }
 
