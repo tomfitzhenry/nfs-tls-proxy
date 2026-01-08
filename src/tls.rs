@@ -11,21 +11,30 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
         match parse_record_envelope(input) {
             Ok((remaining, (hdr, record_data))) => {
                 match hdr.record_type {
-                    TlsRecordType::Handshake => {
+                    TlsRecordType::Handshake
+                    | TlsRecordType::ChangeCipherSpec
+                    | TlsRecordType::Alert => {
                         match parse_tls_plaintext(record_data) {
                             Ok((_, plaintext)) => {
-                                log::debug!("Parsed {} handshake: Len={}", source, plaintext.hdr.len);
+                                log::debug!(
+                                    "Parsed {} {:?}: Len={}",
+                                    source,
+                                    hdr.record_type,
+                                    plaintext.hdr.len
+                                );
                             }
                             Err(e) => {
                                 log::debug!(
-                                    "{} handshake parsing issue (potentially encrypted): {:?}",
+                                    "{} {:?} parsing issue (potentially encrypted): {:?}",
                                     source,
+                                    hdr.record_type,
                                     e
                                 );
                                 // Treat parsing errors as fatal during handshake phase
                                 bail!(
-                                    "{} sent malformed or unsupported handshake data: {:?}",
+                                    "{} sent malformed or unsupported {:?} data: {:?}",
                                     source,
+                                    hdr.record_type,
                                     e
                                 );
                             }
@@ -33,15 +42,14 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
                     }
                     TlsRecordType::ApplicationData => {
                         log::debug!(
-                            "Forwarding {} record: Type=ApplicationData, Len={}",
+                            "Forwarding {} record: Type={:?}, Len={}",
                             source,
+                            hdr.record_type,
                             hdr.len
                         );
                         found_app_data = true;
                     }
-                    TlsRecordType::ChangeCipherSpec
-                    | TlsRecordType::Alert
-                    | TlsRecordType::Heartbeat => {
+                    TlsRecordType::Heartbeat => {
                         log::debug!(
                             "Forwarding {} record: Type={:?}, Len={}",
                             source,
@@ -126,6 +134,29 @@ mod tests {
         let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
         assert_eq!(consumed, 9 + 7);
         assert!(hit_app_data);
+    }
+
+    #[test]
+    fn test_process_tls_buffer_change_cipher_spec() {
+        let buf = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        assert_eq!(consumed, 6);
+        assert!(!hit_app_data);
+    }
+
+    #[test]
+    fn test_process_tls_buffer_alert() {
+        let buf = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00]; // Close notify
+        let (consumed, hit_app_data) = process_tls_buffer(&buf, "Test").unwrap();
+        assert_eq!(consumed, 7);
+        assert!(!hit_app_data);
+    }
+
+    #[test]
+    fn test_process_tls_buffer_invalid_ccs() {
+        let buf = [0x14, 0x03, 0x03, 0x00, 0x01, 0x02]; // CCS must be 1
+        let res = process_tls_buffer(&buf, "Test");
+        assert!(res.is_err());
     }
 
     #[test]
