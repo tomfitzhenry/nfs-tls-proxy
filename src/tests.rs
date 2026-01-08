@@ -121,3 +121,130 @@ async fn test_full_proxy_flow_real_tls() -> Result<()> {
     
     Ok(())
 }
+
+#[tokio::test]
+async fn test_abort_on_invalid_starttls() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Start Dummy Upstream (just to accept proxy connection)
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    
+    let _upstream_handle = tokio::spawn(async move {
+        // Just accept and maybe read a bit, then die
+        let _ = upstream_listener.accept().await;
+    });
+
+    // 2. Start Proxy
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_addr = proxy_listener.local_addr()?.to_string();
+
+    tokio::spawn(async move {
+        if let Ok((client_socket, _)) = proxy_listener.accept().await {
+            let _ = handle_connection(client_socket, upstream_addr).await;
+        }
+    });
+
+    // 3. Client Interaction: Send INVALID STARTTLS (wrong program ID)
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+
+    let mut xdr_frame = Vec::new();
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0xCAFEBABE)?; // XID
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0)?; // CALL
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 2)?; // RPC v2
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 999999)?; // WRONG PROGRAM
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 1)?; // v1
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0)?; // proc 0
+
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    AsyncWriteExt::write_u32(&mut client, len).await?;
+    client.write_all(&xdr_frame).await?;
+
+    // 4. Verify Proxy Aborted
+    // We expect the proxy to close the connection, so a read should return EOF (0 bytes)
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await?;
+    assert_eq!(n, 0, "Proxy should have closed the connection due to invalid XDR");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_abort_on_wonky_tls_handshake() -> Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // 1. Setup Dummy Upstream
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?.to_string();
+    
+    let upstream_handle = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.unwrap();
+        
+        // Expect STARTTLS XDR
+        let mut frag_header = [0u8; 4];
+        socket.read_exact(&mut frag_header).await.unwrap();
+        let len = (u32::from_be_bytes(frag_header) & 0x7FFFFFFF) as usize;
+        let mut buf = vec![0u8; len];
+        socket.read_exact(&mut buf).await.unwrap();
+        
+        // Reply with SUCCESS
+        let reply_data = [0u8; 16]; 
+        let len_val: u32 = 16 | 0x80000000;
+        socket.write_all(&len_val.to_be_bytes()).await.unwrap();
+        socket.write_all(&reply_data).await.unwrap();
+        
+        // Now just wait
+        let mut buf = [0u8; 1024];
+        let _ = socket.read(&mut buf).await;
+    });
+
+    // 2. Start Proxy
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_addr = proxy_listener.local_addr()?.to_string();
+
+    tokio::spawn(async move {
+        if let Ok((client_socket, _)) = proxy_listener.accept().await {
+            let _ = handle_connection(client_socket, upstream_addr).await;
+        }
+    });
+
+    // 3. Client Interaction
+    let mut client = TcpStream::connect(&proxy_addr).await?;
+
+    // Send Valid STARTTLS XDR
+    let mut xdr_frame = Vec::new();
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0x12345678)?; 
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0)?; 
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 2)?; 
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 100235)?; 
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 1)?; 
+    WriteBytesExt::write_u32::<BigEndian>(&mut xdr_frame, 0)?; 
+
+    let len = xdr_frame.len() as u32 | 0x80000000;
+    AsyncWriteExt::write_u32(&mut client, len).await?;
+    client.write_all(&xdr_frame).await?;
+
+    // Read STARTTLS Reply (consume it)
+    let mut reply_header = [0u8; 4];
+    client.read_exact(&mut reply_header).await?;
+    let reply_len = (u32::from_be_bytes(reply_header) & 0x7FFFFFFF) as usize;
+    let mut reply_buf = vec![0u8; reply_len];
+    client.read_exact(&mut reply_buf).await?;
+
+    // 4. Send WONKY TLS record (invalid ContentType 0xFF)
+    let wonky_record = [
+        0xFF,       // Invalid Record Type
+        0x03, 0x03, // TLS 1.2 record version
+        0x00, 0x05, // Length: 5
+        0x01, 0x02, 0x03, 0x04, 0x05, // Junk data
+    ];
+    client.write_all(&wonky_record).await?;
+
+    // 5. Verify Proxy Aborted
+    let mut buf = [0u8; 1];
+    let n = client.read(&mut buf).await?;
+    assert_eq!(n, 0, "Proxy should have closed connection due to wonky TLS record");
+
+    let _ = upstream_handle.await;
+    Ok(())
+}
