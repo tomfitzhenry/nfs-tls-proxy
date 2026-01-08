@@ -11,57 +11,51 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
             break;
         }
 
-        // Try to parse as plaintext first (to inspect handshake messages)
-        match parse_tls_plaintext(remaining) {
-            Ok((rem, plaintext)) => {
-                let consumed = remaining.len() - rem.len();
-                log::debug!("Parsed {} record: Type={:?}, Len={}", source, plaintext.hdr.record_type, plaintext.hdr.len);
-                
-                if plaintext.hdr.record_type == TlsRecordType::ApplicationData {
+        match parse_tls_record_header(remaining) {
+            Ok((_, hdr)) => {
+                let total_record_len = 5 + hdr.len as usize;
+                if remaining.len() < total_record_len {
+                    break; // Need more data for the full record
+                }
+
+                // Sanity check: valid record type (20-24)
+                let raw_type = hdr.record_type.0;
+                if raw_type < 20 || raw_type > 24 {
+                    bail!("{} sent invalid TLS record type: {}", source, raw_type);
+                }
+
+                let record_data = &remaining[..total_record_len];
+
+                if hdr.record_type == TlsRecordType::Handshake {
+                    match parse_tls_plaintext(record_data) {
+                        Ok((_, plaintext)) => {
+                            log::debug!("Parsed {} handshake: Len={}", source, plaintext.hdr.len);
+                        }
+                        Err(_) => {
+                            // Handshake might be encrypted (TLS 1.3) or just malformed for the parser.
+                            // We don't bail here, just treat it as an opaque record.
+                            log::debug!("Forwarding {} opaque or encrypted handshake: Len={}", source, hdr.len);
+                        }
+                    }
+                } else {
+                    log::debug!("Forwarding {} record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
+                }
+
+                if hdr.record_type == TlsRecordType::ApplicationData {
                     found_app_data = true;
                 }
-                
-                offset += consumed;
-                
+
+                offset += total_record_len;
+
                 if found_app_data {
                     return Ok((offset, true));
                 }
             }
             Err(tls_parser::Err::Incomplete(_)) => {
-                break; // Need more data
+                break; // Need more data for header
             }
-            Err(_) => {
-                // Background: if parse_tls_plaintext fails, it might be an encrypted record (e.g. TLS 1.3 after ServerHello).
-                // We fallback to just parsing the record header to advance and check for ApplicationData.
-                match parse_tls_record_header(remaining) {
-                    Ok((_, hdr)) => {
-                        // Sanity check: valid record type (20-24)
-                        let raw_type = hdr.record_type.0;
-                        if raw_type < 20 || raw_type > 24 {
-                            bail!("{} sent invalid TLS record type: {}", source, raw_type);
-                        }
-
-                        let total_record_len = 5 + hdr.len as usize;
-                        if remaining.len() < total_record_len {
-                            break; // Need more data for the full record
-                        }
-                        
-                        log::debug!("Forwarding {} encrypted record: Type={:?}, Len={}", source, hdr.record_type, hdr.len);
-                        
-                        if hdr.record_type == TlsRecordType::ApplicationData {
-                            found_app_data = true;
-                        }
-                        
-                        offset += total_record_len;
-                        
-                        if found_app_data {
-                            return Ok((offset, true));
-                        }
-                    }
-                    Err(e) => {
-                        bail!("{} sent truly invalid TLS data: {:?}", source, e);
-                    }
-                }
+            Err(e) => {
+                bail!("{} sent truly invalid TLS data: {:?}", source, e);
             }
         }
     }
