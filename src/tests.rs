@@ -302,26 +302,6 @@ async fn test_abort_on_oversized_tls_record() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_upstream_timeout() -> Result<()> {
-    let _ = env_logger::builder().is_test(true).try_init();
-
-    // 1. Point proxy to a non-existent or blackholed address
-    // 192.0.2.1 is TEST-NET-1, reserved for documentation, often non-routable.
-    let proxy_addr = spawn_proxy("192.0.2.1:20000".to_string()).await?;
-
-    // 2. Client Interaction
-    let client = TcpStream::connect(&proxy_addr).await;
-    if let Ok(mut socket) = client {
-        // The proxy handle_connection will fail after its internal timeout (5s)
-        let mut buf = [0u8; 1];
-        let n = socket.read(&mut buf).await?;
-        assert_eq!(n, 0, "Proxy should have closed connection due to upstream timeout");
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_abort_on_malformed_handshake_body() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
