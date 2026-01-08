@@ -10,47 +10,52 @@ pub fn process_tls_buffer(buf: &[u8], source: &str) -> Result<(usize, bool)> {
     while !input.is_empty() {
         match parse_record_envelope(input) {
             Ok((remaining, (hdr, record_data))) => {
-                // Sanity check: valid record type (20-24)
-                let raw_type = hdr.record_type.0;
-                if !(20..=24).contains(&raw_type) {
-                    bail!("{} sent invalid TLS record type: {}", source, raw_type);
-                }
-
-                if hdr.record_type == TlsRecordType::Handshake {
-                    match parse_tls_plaintext(record_data) {
-                        Ok((_, plaintext)) => {
-                            log::debug!("Parsed {} handshake: Len={}", source, plaintext.hdr.len);
-                        }
-                        Err(e) => {
-                            // Handshake might be encrypted (TLS 1.3), but if it's plaintext Handshake,
-                            // we expect it to be parseable. In practice, tls-parser might fail on
-                            // encrypted records if it tries to parse them as plaintext.
-                            // However, we want to be strict where possible.
-                            // We'll bail if it's truly malformed handshake data that isn't encrypted.
-                            log::debug!("{} handshake parsing issue (potentially encrypted): {:?}", source, e);
-                            
-                            // For security, we should distinguish between "encrypted" and "malformed".
-                            // If we can't parse it, and we are during the initial stages where
-                            // we expect plaintext, this is an issue.
-                            // However, to keep it simple and safe for TLS 1.3, we'll only bail if
-                            // we're CERTAIN it should be plaintext.
-                            // For now, let's keep it as is but add a comment, OR be strict if we see
-                            // very obvious garbage.
-                            // Actually, let's follow the plan: "treat parsing errors as fatal".
-                            bail!("{} sent malformed or unsupported handshake data: {:?}", source, e);
+                match hdr.record_type {
+                    TlsRecordType::Handshake => {
+                        match parse_tls_plaintext(record_data) {
+                            Ok((_, plaintext)) => {
+                                log::debug!("Parsed {} handshake: Len={}", source, plaintext.hdr.len);
+                            }
+                            Err(e) => {
+                                log::debug!(
+                                    "{} handshake parsing issue (potentially encrypted): {:?}",
+                                    source,
+                                    e
+                                );
+                                // Treat parsing errors as fatal during handshake phase
+                                bail!(
+                                    "{} sent malformed or unsupported handshake data: {:?}",
+                                    source,
+                                    e
+                                );
+                            }
                         }
                     }
-                } else {
-                    log::debug!(
-                        "Forwarding {} record: Type={:?}, Len={}",
-                        source,
-                        hdr.record_type,
-                        hdr.len
-                    );
-                }
-
-                if hdr.record_type == TlsRecordType::ApplicationData {
-                    found_app_data = true;
+                    TlsRecordType::ApplicationData => {
+                        log::debug!(
+                            "Forwarding {} record: Type=ApplicationData, Len={}",
+                            source,
+                            hdr.len
+                        );
+                        found_app_data = true;
+                    }
+                    TlsRecordType::ChangeCipherSpec
+                    | TlsRecordType::Alert
+                    | TlsRecordType::Heartbeat => {
+                        log::debug!(
+                            "Forwarding {} record: Type={:?}, Len={}",
+                            source,
+                            hdr.record_type,
+                            hdr.len
+                        );
+                    }
+                    _ => {
+                        bail!(
+                            "{} sent invalid or unsupported TLS record type: {}",
+                            source,
+                            hdr.record_type.0
+                        );
+                    }
                 }
 
                 input = remaining;
